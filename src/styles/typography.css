@@ -13,10 +13,6 @@
       @apply text-foreground mb-3;
     }
 
-    h3 {
-      @apply italic;
-    }
-
     p,
     strong,
     ol,
@@ -60,6 +56,8 @@
     }
 
     table {
+      @apply text-sm tabular-nums;
+
       th,
       td {
         @apply border-border border p-2;
@@ -68,6 +66,19 @@
       th {
         @apply py-1.5;
       }
+
+      [align="right"] {
+        @apply text-right;
+      }
+
+      [align="center"] {
+        @apply text-center;
+      }
+    }
+
+    code,
+    pre {
+      @apply font-mono;
     }
 
     code {

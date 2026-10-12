@@ -11,9 +11,14 @@ export function getFontPathByWeight(
   const style = options?.style ?? "normal";
   const format = options?.format ?? "truetype";
 
-  for (const font of fonts) {
-    if (font.weight === String(weight) && font.style === style) {
-      const src = font.src.find(file => file.format === format) ?? font.src[0];
+  const matching = fonts.filter(
+    font => font.weight === String(weight) && font.style === style
+  );
+
+  // satori reads TrueType and WOFF, not WOFF2
+  for (const wanted of [format, "woff"]) {
+    for (const font of matching) {
+      const src = font.src.find(file => file.format === wanted);
       if (src) return src.url;
     }
   }
