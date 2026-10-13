@@ -26,14 +26,14 @@ Almost all of the work for strings happens in one function, [`php_json_escape_st
 - Release builds from commits (`-O2`), each change merged onto the same master.
 - **Compilers:** GCC 13.3, GCC 14.2 and clang 18.1 / 20.1 on an i7-13700H (one P-core pinned); GCC 15.2 and clang 21.1 on a Ryzen 9 5950X.
 - **Numbers:** cycles and instructions per `json_encode()` call from `perf stat`, N calls minus the same process with 0 calls, median of alternating runs. Cycles rather than nanoseconds, because a laptop under load changes its clock.
-- **Correctness:** output and `json_last_error()` compared with master on every pair of bytes, every three-byte sequence with an E0..EF lead, every byte value at every position of short strings, literal keys, and 200,000 to 1,000,000 random strings depending on the change, under up to 11 flag sets; for #24283 also four-byte sequences with an F0..FF lead. Every change in this post passed. Nothing below is about bugs; it is all about speed.
+- **Correctness:** output and `json_last_error()` compared with master on every pair of bytes, every three-byte sequence with an E0..EF lead, every byte value at every position of short strings, literal keys, and 200,000 to 1,000,000 random strings depending on the change, under up to 11 flag sets; for [#24283](https://github.com/php/php-src/pull/24283) also four-byte sequences with an F0..FF lead. Every change in this post passed. Nothing below is about bugs; it is all about speed.
 
-Source links point to master at `bd6c637d071`. The changes were tested at these commits:
+Source links point to master at [`bd6c637d071`](https://github.com/php/php-src/commit/bd6c637d071). The changes were tested at these commits:
 
-- on master `bd6c637d071`, with four compilers (#24283 also with two on AMD): #24283 at `63792a2d9f5` (first version `ca35c079a1f`), #23682 at `5114f867221`, #23675 at `27d9c1cdd8c`;
-- on master `80d2b997192`, with GCC 13 only: #17734 at `860b11f21c6`, #22932 at `9338aa1ebb7`, #22492 at `6e114dbbe96`.
+- on master [`bd6c637d071`](https://github.com/php/php-src/commit/bd6c637d071), with four compilers ([#24283](https://github.com/php/php-src/pull/24283) also with two on AMD): [#24283](https://github.com/php/php-src/pull/24283) at [`63792a2d9f5`](https://github.com/ArtUkrainskiy/php-src/commit/63792a2d9f5) (first version [`ca35c079a1f`](https://github.com/ArtUkrainskiy/php-src/commit/ca35c079a1f)), [#23682](https://github.com/php/php-src/pull/23682) at [`5114f867221`](https://github.com/php/php-src/commit/5114f867221), [#23675](https://github.com/php/php-src/pull/23675) at [`27d9c1cdd8c`](https://github.com/php/php-src/commit/27d9c1cdd8c);
+- on master [`80d2b997192`](https://github.com/php/php-src/commit/80d2b997192), with GCC 13 only: [#17734](https://github.com/php/php-src/pull/17734) at [`860b11f21c6`](https://github.com/php/php-src/commit/860b11f21c6), [#22932](https://github.com/php/php-src/pull/22932) at [`9338aa1ebb7`](https://github.com/php/php-src/commit/9338aa1ebb7), [#22492](https://github.com/php/php-src/pull/22492) at [`6e114dbbe96`](https://github.com/php/php-src/commit/6e114dbbe96).
 
-The measurements of #24283, with raw runs and the commands to reproduce them, are in [php-src-bench](https://github.com/ArtUkrainskiy/php-src-bench/tree/main/reports/json-encode-utf8-inline). The numbers for #23675 and #23682 are in my comments on those pull requests; the first-pass raw data for #17734, #22932 and #22492 is not published yet.
+The measurements of [#24283](https://github.com/php/php-src/pull/24283), with raw runs and the commands to reproduce them, are in [php-src-bench](https://github.com/ArtUkrainskiy/php-src-bench/tree/main/reports/json-encode-utf8-inline). The numbers for [#23675](https://github.com/php/php-src/pull/23675) and [#23682](https://github.com/php/php-src/pull/23682) are in my comments on those pull requests; the first-pass raw data for [#17734](https://github.com/php/php-src/pull/17734), [#22932](https://github.com/php/php-src/pull/22932) and [#22492](https://github.com/php/php-src/pull/22492) is not published yet.
 
 ## The open pull requests
 
@@ -45,13 +45,13 @@ The measurements of #24283, with raw runs and the commands to reproduce them, ar
 | [#22932](https://github.com/php/php-src/pull/22932) | SIMD scan of the clean prefix only            | open                                                                             |
 | [#22492](https://github.com/php/php-src/pull/22492) | fast path for keys                            | no activity since July                                                           |
 
-### SIMD (#23675, #22932, #17734)
+### SIMD ([#23675](https://github.com/php/php-src/pull/23675), [#22932](https://github.com/php/php-src/pull/22932), [#17734](https://github.com/php/php-src/pull/17734))
 
-On long ASCII all three are about 5× faster than master (0.19–0.22 of master's cycles). On text with escapes spread through it #23675 keeps the vector loop going after each escape (HTML 0.21), while #22932 only skips the prefix before the first special byte and then runs at master's speed.
+On long ASCII all three are about 5× faster than master (0.19–0.22 of master's cycles). On text with escapes spread through it [#23675](https://github.com/php/php-src/pull/23675) keeps the vector loop going after each escape (HTML 0.21), while [#22932](https://github.com/php/php-src/pull/22932) only skips the prefix before the first special byte and then runs at master's speed.
 
-The cost is non-ASCII text with default flags. There every byte of every character needs escaping, so the vector path never skips anything and each character also pays the walk over the block's bitmask. With GCC that makes Cyrillic and CJK 4–18% slower with #23675 (and 17–29% with #17734, measured with GCC 13). With clang, #23675 is at 0.89–0.98 on the same inputs: not because its loop is better there, but because clang's master is worse, as the next section shows.
+The cost is non-ASCII text with default flags. There every byte of every character needs escaping, so the vector path never skips anything and each character also pays the walk over the block's bitmask. With GCC that makes Cyrillic and CJK 4–18% slower with [#23675](https://github.com/php/php-src/pull/23675) (and 17–29% with [#17734](https://github.com/php/php-src/pull/17734), measured with GCC 13). With clang, [#23675](https://github.com/php/php-src/pull/23675) is at 0.89–0.98 on the same inputs: not because its loop is better there, but because clang's master is worse, as the next section shows.
 
-### The lookup table (#23682)
+### The lookup table ([#23682](https://github.com/php/php-src/pull/23682))
 
 Replacing the bit test with a 256-byte table removes instructions with every compiler: 25–33% fewer on ASCII. Whether that becomes time depends on the compiler:
 
@@ -116,9 +116,9 @@ Together, with the first version of the inline decoder, cycles relative to maste
 | 1,000 arrays of 10 fields |   0.89 |   0.92 |     0.97 |     0.91 |
 | worst of 14 inputs        |   1.00 |   1.03 |     1.01 |     1.05 |
 
-So the table from #23682 is not just a smaller win: it is the piece that makes the result independent of the compiler, once the scan is a loop of its own.
+So the table from [#23682](https://github.com/php/php-src/pull/23682) is not just a smaller win: it is the piece that makes the result independent of the compiler, once the scan is a loop of its own.
 
-The same thing showed up from the other side in #23675. Counting instructions per non-ASCII character in `php_json_escape_string()` itself, master runs 74 with GCC and 93 with clang: clang stores seven registers to the stack before every call to `php_next_utf8_char()` and loads them back after it. #23675 adds about 9 instructions per character for its bitmask walk with both compilers, but its new loop also happens to stop clang from spilling, so with clang it comes out ahead and with GCC behind. Neither result says much about the SIMD code itself.
+The same thing showed up from the other side in [#23675](https://github.com/php/php-src/pull/23675). Counting instructions per non-ASCII character in `php_json_escape_string()` itself, master runs 74 with GCC and 93 with clang: clang stores seven registers to the stack before every call to `php_next_utf8_char()` and loads them back after it. [#23675](https://github.com/php/php-src/pull/23675) adds about 9 instructions per character for its bitmask walk with both compilers, but its new loop also happens to stop clang from spilling, so with clang it comes out ahead and with GCC behind. Neither result says much about the SIMD code itself.
 
 Lessons I am keeping:
 
@@ -128,15 +128,15 @@ Lessons I am keeping:
 
 ## Next door
 
-- **`htmlspecialchars()`.** [#23957](https://github.com/php/php-src/pull/23957) returns the input when nothing needs encoding and is approved; [#24145](https://github.com/php/php-src/pull/24145) speeds up strings that do need encoding. They touch the same function; the plan agreed in #23957 is to land it first and rebase #24145 on top. On top of #23957, #24145 is still 1.8–2.8× faster on English, HTML, Markdown and JavaScript.
+- **`htmlspecialchars()`.** [#23957](https://github.com/php/php-src/pull/23957) returns the input when nothing needs encoding and is approved; [#24145](https://github.com/php/php-src/pull/24145) speeds up strings that do need encoding. They touch the same function; the plan agreed in [#23957](https://github.com/php/php-src/pull/23957) is to land it first and rebase [#24145](https://github.com/php/php-src/pull/24145) on top. On top of [#23957](https://github.com/php/php-src/pull/23957), [#24145](https://github.com/php/php-src/pull/24145) is still 1.8–2.8× faster on English, HTML, Markdown and JavaScript.
 - **`json_decode()`.** Text escaped as `\uXXXX`, which is what `json_encode()` produces by default, is the expensive case for the decoder: the scanner matches every escape twice. Converting the hex digits without branches is the first, small step I am measuring.
 - **Keys.** Keys repeat from record to record and are often interned (literal keys, declared properties, mysqlnd column names), so a per-call cache of keys that need no escaping looks worth measuring properly. It would not help SQLite or PostgreSQL rows, whose column names are not interned.
 
 ## How the pieces fit together
 
 - [#24283](https://github.com/php/php-src/pull/24283) is independent of the other pull requests and does not change any public symbol.
-- My scan-split experiment uses the lookup table from #23682, so I would only propose it on top of that change.
-- #23675 with the first version of #24283 merged on top is faster than master on the Cyrillic, CJK and French inputs: Cyrillic takes 0.85–0.87 of master's cycles with GCC and 0.66–0.68 with clang.
-- For `htmlspecialchars()`, the order of #23957 and #24145 is agreed in #23957.
+- My scan-split experiment uses the lookup table from [#23682](https://github.com/php/php-src/pull/23682), so I would only propose it on top of that change.
+- [#23675](https://github.com/php/php-src/pull/23675) with the first version of [#24283](https://github.com/php/php-src/pull/24283) merged on top is faster than master on the Cyrillic, CJK and French inputs: Cyrillic takes 0.85–0.87 of master's cycles with GCC and 0.66–0.68 with clang.
+- For `htmlspecialchars()`, the order of [#23957](https://github.com/php/php-src/pull/23957) and [#24145](https://github.com/php/php-src/pull/24145) is agreed in [#23957](https://github.com/php/php-src/pull/23957).
 
-The numbers for #24283 are reproducible from [the report](https://github.com/ArtUkrainskiy/php-src-bench/tree/main/reports/json-encode-utf8-inline). If you maintain an application that sends a lot of non-ASCII JSON, I would like to hear how these numbers look on your data.
+The numbers for [#24283](https://github.com/php/php-src/pull/24283) are reproducible from [the report](https://github.com/ArtUkrainskiy/php-src-bench/tree/main/reports/json-encode-utf8-inline). If you maintain an application that sends a lot of non-ASCII JSON, I would like to hear how these numbers look on your data.
