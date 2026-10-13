@@ -5,7 +5,7 @@ export default defineAstroPaperConfig({
     url: "https://artukrainskiy.github.io/",
     title: "Artem Ukrainskiy",
     description:
-      "Engineering notes on PHP internals and performance, with measurements.",
+      "Engineering notes on backend systems, performance and open source, with measurements.",
     author: "Artem Ukrainskiy",
     profile: "https://github.com/ArtUkrainskiy",
     ogImage: "default-og.jpg",
