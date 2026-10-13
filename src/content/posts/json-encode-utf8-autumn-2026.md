@@ -15,10 +15,10 @@ tags:
 
 ## Where json_encode() spends its time
 
-Almost all of the work for strings happens in one function, `php_json_escape_string()`. On a typical API response, 1,000 records of 10 short fields, it takes about half of the instructions of the whole `json_encode()` call. Three things in it cost the most on master:
+Almost all of the work for strings happens in one function, [`php_json_escape_string()`](https://github.com/php/php-src/blob/bd6c637d0710521ad30370d13f3f47be34ccda0b/ext/json/json_encoder.c#L350). On a typical API response, 1,000 records of 10 short fields, it takes about half of the instructions of the whole `json_encode()` call. Three things in it cost the most on master:
 
-- **The scan for bytes that need escaping.** Every byte is checked against a 256-bit table (`ZEND_BIT_TEST`), about 11 instructions per byte with GCC 13.
-- **Non-ASCII characters.** Each one goes through `php_next_utf8_char()` in `ext/standard/html.c`, which calls the generic decoder `get_next_char()` for 14 charsets. That is about 43 instructions per character (callgrind), before the character is even escaped.
+- **The scan for bytes that need escaping.** Every byte is checked against a [256-bit table](https://github.com/php/php-src/blob/bd6c637d0710521ad30370d13f3f47be34ccda0b/ext/json/json_encoder.c#L387-L392) (`ZEND_BIT_TEST`), about 11 instructions per byte with GCC 13.
+- **Non-ASCII characters.** Each one goes through [`php_next_utf8_char()`](https://github.com/php/php-src/blob/bd6c637d0710521ad30370d13f3f47be34ccda0b/ext/standard/html.c#L349-L356) in `ext/standard/html.c`, which calls the generic decoder [`get_next_char()`](https://github.com/php/php-src/blob/bd6c637d0710521ad30370d13f3f47be34ccda0b/ext/standard/html.c#L87) for 14 charsets ([its UTF-8 case](https://github.com/php/php-src/blob/bd6c637d0710521ad30370d13f3f47be34ccda0b/ext/standard/html.c#L104)). That is about 43 instructions per character (callgrind), before the character is even escaped.
 - **The scan position lives in memory.** The address of the loop's position variable is passed to that decoder, so the compiler keeps the variable on the stack. With GCC the loop over plain bytes stores it and loads it back on every byte, and the next byte's address waits for that load.
 
 ## How I measured
@@ -28,11 +28,16 @@ Almost all of the work for strings happens in one function, `php_json_escape_str
 - **Numbers:** cycles and instructions per `json_encode()` call from `perf stat`, N calls minus the same process with 0 calls, median of alternating runs. Cycles rather than nanoseconds, because a laptop under load changes its clock.
 - **Correctness:** output and `json_last_error()` compared with master on every pair of bytes, every three-byte sequence with an E0..EF lead, every byte value at every position of short strings, literal keys, and a million random strings, under up to 11 flag sets. Every change in this post passed. Nothing below is about bugs; it is all about speed.
 
+Source links point to master at `bd6c637d071`. The changes were tested at these commits:
+
+- on master `bd6c637d071`, with four compilers: #24283 at `63792a2d9f5` (first version `ca35c079a1f`), #23682 at `5114f867221`, #23675 at `27d9c1cdd8c`;
+- on master `80d2b997192`, with GCC 13 only: #17734 at `860b11f21c6`, #22932 at `9338aa1ebb7`, #22492 at `6e114dbbe96`.
+
 Everything is in [php-src-bench](https://github.com/ArtUkrainskiy/php-src-bench/tree/main/reports/json-encode-utf8-inline), with the commands to reproduce it.
 
 ## The open pull requests
 
-| PR                                                  | What it does                                  | State in mid-October                                                             |
+| PR                                                  | What it does                                  | State on 13 October 2026                                                         |
 | --------------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------- |
 | [#23675](https://github.com/php/php-src/pull/23675) | SSE2/NEON scan of 16 bytes at a time          | my measurements posted on 13 October, no maintainer review yet                   |
 | [#23682](https://github.com/php/php-src/pull/23682) | 256-byte lookup table instead of the bit test | reviewed, no activity since 18 September                                         |
@@ -60,9 +65,34 @@ With GCC, Cyrillic gets slower at fewer instructions: branch mispredictions on t
 
 ### Inline UTF-8 decoding ([#24283](https://github.com/php/php-src/pull/24283), mine)
 
-`php_next_utf8_char_inline()` decodes ASCII and valid two- and three-byte UTF-8 at the call site and leaves everything else, including every invalid sequence, to the existing `php_next_utf8_char()`. The shortcut is exact: C2..DF followed by a continuation byte is always a valid shortest form, and for three bytes it checks the same two conditions as the old code (not overlong, not a surrogate). With four compilers on the Intel machine and two on a Ryzen 9 5950X, Cyrillic takes 0.73–0.80 of master's cycles and CJK 0.70–0.78, and ASCII runs the same instructions as before.
+`php_next_utf8_char_inline()` decodes valid UTF-8 at the call site and leaves every invalid sequence to the existing `php_next_utf8_char()`. The shortcut is exact: C2..DF followed by a continuation byte is always a valid shortest form; for three bytes it checks the same two conditions as the old code (not overlong, not a surrogate), and for four bytes the same range, U+10000..U+10FFFF. With four compilers on the Intel machine and two on a Ryzen 9 5950X, Cyrillic takes 0.70–0.91 of master's cycles, CJK 0.68–0.84 and emoji 0.82–0.89, and ASCII runs the same instructions as before. The first version of the PR left four-byte characters to the old call after the inline checks, which made emoji 2–13% slower than master; measuring emoji caught it, and the current version decodes them inline too.
 
-Two caveats. With GCC 13 and 14 on the Intel machine, URLs and ASCII with an occasional escaped é are 10–14% slower in cycles, from the layout GCC picks for the path of special characters; clang and the AMD machine show nothing, and the scan split described below removes it. An input with an é exactly every 31 bytes looked worse at first, but that was the branch predictor learning the period: with é at random positions the change is faster everywhere. And my other PR, [#24145](https://github.com/php/php-src/pull/24145) for `htmlspecialchars()`, makes `get_next_char()` always inline, which already takes Cyrillic to 0.82 on its own; on top of it the inline decoder still removes 14–20% of the instructions on non-ASCII text, but with GCC that shows mostly on CJK and on `JSON_UNESCAPED_UNICODE`.
+```text
+master:
+  php_json_escape_string()
+    └─ php_next_utf8_char()               html.c, exported
+         └─ get_next_char(cs_utf_8, ...)  switch over 14 charsets
+
+#24283:
+  php_json_escape_string()
+    ├─ valid UTF-8 (2, 3 or 4 bytes) ──> decoded inline
+    └─ invalid or truncated ──────────> php_next_utf8_char(), as before
+```
+
+The two-byte case is the whole idea in small:
+
+```c
+if (EXPECTED(c < 0xe0)) {
+	/* C2..DF + continuation byte: always a valid shortest form */
+	if (c >= 0xc2 && avail >= 2 && (str[pos + 1] & 0xc0) == 0x80) {
+		*cursor = pos + 2;
+		*status = SUCCESS;
+		return ((c & 0x1f) << 6) | (str[pos + 1] & 0x3f);
+	}
+}
+```
+
+Two caveats. With GCC 13 and 14 on the Intel machine some inputs take 5–20% more cycles at the same instruction count: a newline every 40 bytes, URLs, ASCII with an occasional escaped é, and with GCC 13 also 1,000 arrays of 10 fields (1.10). `php_json_escape_string()` grows by 487 bytes, the functions after it move by 192 bytes, and branch mispredictions triple across the hot code, including code the change does not touch; clang and the AMD machine show nothing of the kind (0.91–1.02), and for the first version the scan split described below removed it. An input with an é exactly every 31 bytes looked worse at first, but that was the branch predictor learning the period, so the tables use é at random positions. And my other PR, [#24145](https://github.com/php/php-src/pull/24145) for `htmlspecialchars()`, makes `get_next_char()` always inline, which already takes Cyrillic to 0.82 on its own; measured with the first version, the inline decoder still removes 14–20% of the instructions on non-ASCII text on top of it, but with GCC that shows mostly on CJK and on `JSON_UNESCAPED_UNICODE`.
 
 ## The compiler is part of the result
 
@@ -75,7 +105,7 @@ Fixing that for clang by reshaping the loop broke Cyrillic for clang through bra
 - **Move the scan into a small function** that returns the length of the plain run. The main loop appends the run and handles one special character. The scan loop no longer depends on the code around it, and the position variable disappears.
 - **Use the lookup table** in that scan. With a bit test, GCC 13 compiled the check to `shr %cl` instead of `bt` in the new context, whatever form I wrote it in. A table is one load and a compare on every compiler.
 
-Together, with the inline decoder, cycles relative to master:
+Together, with the first version of the inline decoder, cycles relative to master:
 
 |                           | GCC 13 | GCC 14 | clang 18 | clang 20 |
 | ------------------------- | -----: | -----: | -------: | -------: |
@@ -99,14 +129,14 @@ Lessons I am keeping:
 ## Next door
 
 - **`htmlspecialchars()`.** [#23957](https://github.com/php/php-src/pull/23957) returns the input when nothing needs encoding and is approved; [#24145](https://github.com/php/php-src/pull/24145) speeds up strings that do need encoding. They touch the same function; the plan agreed in #23957 is to land it first and rebase #24145 on top. On top of #23957, #24145 is still 1.8–2.8× faster on English, HTML, Markdown and JavaScript.
-- **`json_decode()`.** Text escaped as `\uXXXX`, which is what `json_encode()` produces by default, costs about 207 instructions per escaped character: the scanner matches every escape twice. Converting the hex digits without branches already saves 12% of the cycles there.
-- **Keys.** Keys repeat from record to record and are often interned (literal keys, declared properties, mysqlnd column names), so a per-call cache of keys that need no escaping saves about 10% on 1,000 records. It does not help SQLite or PostgreSQL rows, whose column names are not interned.
+- **`json_decode()`.** Text escaped as `\uXXXX`, which is what `json_encode()` produces by default, is the expensive case for the decoder: the scanner matches every escape twice. Converting the hex digits without branches is the first, small step I am measuring.
+- **Keys.** Keys repeat from record to record and are often interned (literal keys, declared properties, mysqlnd column names), so a per-call cache of keys that need no escaping looks worth measuring properly. It would not help SQLite or PostgreSQL rows, whose column names are not interned.
 
-## What is likely to happen
+## How the pieces fit together
 
-- The inline UTF-8 decoder is a small, self-contained change with a clear gain on non-ASCII text on every compiler I tried, and it does not change any public symbol: [#24283](https://github.com/php/php-src/pull/24283).
-- The scan split depends on a lookup table. The right table is the one in #23682, so the scan split waits for it, and my review there includes these numbers.
-- The SIMD scan of #23675 is the biggest single win for ASCII. With #24283 merged on top, nothing non-ASCII is slower than master any more: Cyrillic takes 0.85–0.87 of master's cycles with GCC and 0.66–0.68 with clang.
-- `htmlspecialchars()` follows the plan agreed in #23957.
+- [#24283](https://github.com/php/php-src/pull/24283) is independent of the other pull requests and does not change any public symbol.
+- My scan-split experiment uses the lookup table from #23682, so I would only propose it on top of that change.
+- #23675 with the first version of #24283 merged on top is faster than master on the Cyrillic, CJK and French inputs: Cyrillic takes 0.85–0.87 of master's cycles with GCC and 0.66–0.68 with clang.
+- For `htmlspecialchars()`, the order of #23957 and #24145 is agreed in #23957.
 
 Everything above is reproducible from [the report](https://github.com/ArtUkrainskiy/php-src-bench/tree/main/reports/json-encode-utf8-inline). If you maintain an application that sends a lot of non-ASCII JSON, I would like to hear how these numbers look on your data.
