@@ -9,24 +9,30 @@ tags:
   - benchmarks
 ---
 
-Most comparisons of web stacks answer "which one serves more requests per second". I wanted a different answer: how much CPU and memory one ordinary API request costs, on each stack as its vendors ship it, under the same rules for everyone. I wrote the same small JSON API twelve times — PHP (four runtimes), Go, Node (two servers), Rust, Java, .NET, Python and Ruby — and measured all of them on one machine, against PostgreSQL and against MySQL. The result that surprised me most is not about languages at all: on PostgreSQL, whether the database driver keeps prepared statements by default moves the cost more than the runtime does. On MySQL, where most drivers send plain text queries, the database costs about the same for most stacks, and the stack's own CPU matters more.
+Most comparisons of web stacks answer "which one serves more requests per second". I wanted a different answer: how much CPU and memory one ordinary API request costs, on each stack as its vendors ship it, under the same rules for everyone. I wrote the same small JSON API twelve times — PHP (four runtimes), Go, Node (two servers), Rust, Java, .NET, Python and Ruby — and measured all of them on one machine, against PostgreSQL and against MySQL. This is stage 1 of the project: every stack and every database driver on its defaults. Tuning, frameworks and the cloud are later stages.
 
-Everything below comes from the repository [web-request-cost](https://github.com/ArtUkrainskiy/web-request-cost/tree/afd7ea6ee4f2f10069bd029e0c29a705c034861c) at commit `afd7ea6`: the code, the rules, 700 raw records and the script that turns them into [the tables](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md). The [mysqlnd finding](#mysqlnd-statistics-in-zts-builds) adds a follow-up series in the same repository; the [Swoole question](#swoole-on-postgresql-at-4000-reqs) cites one run that is not in it.
+In short:
+
+- **On PostgreSQL the driver matters more than the language.** Three drivers keep prepared statements on each connection by default (Go's pgx, Java's PgJDBC, Python's asyncpg). With them the database spends about 0.5 ms of CPU per request, with all the others 1.2–1.5 ms. That difference is larger than the whole CPU cost of most runtimes. It holds within one stack too: with pgx's statement cache turned off, Go's database CPU goes from 0.53 to 1.21 ms per request, and with Npgsql's `Max Auto Prepare` turned on, .NET's goes from 1.29 to 0.59 ms ([follow-up series](https://github.com/ArtUkrainskiy/web-request-cost/tree/main/results/2026-10-drivers)).
+- **On MySQL** most drivers send plain text queries, so the database costs about the same for every stack, and the stack's own CPU decides the order. Go is among the most expensive there, because go-sql-driver prepares and closes every statement by default. With `interpolateParams=true` Go's total drops from 1.89 to 1.54 ms, into the middle of the table.
+- **PHP:** on MySQL, Swoole has the lowest total of all twelve stacks, and FrankenPHP is second, within 0.05 ms of Ruby, Java and Node. On PostgreSQL all four PHP stacks are in the expensive half: pdo_pgsql has no statement cache and also prepares and closes every statement. For FPM, `PDO::ATTR_EMULATE_PREPARES` or PgBouncer cuts the total by 18–27%. RoadRunner needs about ten times more memory per waiting request than FPM.
+- **Money:** in the repository's cost model, 1000 req/s on PostgreSQL costs $49–55 a month for Go, Java and Python and $79–105 for the other stacks, database included. The differences are tens of dollars a month, and the database is the larger part for most stacks.
+- **Limits:** one desktop machine over loopback, one small read-only API without frameworks, nothing tuned. I wrote the implementations with an AI assistant and checked that they return the same responses, but each language's community hasn't reviewed them yet. Fixes were measured for PHP, Go and .NET. The Rust and Node remedies are the next stage. More in [What this does not show](#what-this-does-not-show).
 
 ## Contents
 
 ## What was measured
 
 - **The API** ([spec](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/spec/spec.md)): a token lookup in the database, then a page of 20 posts with authors, tags and comment counts, or one post with its comments. Four SQL statements on the main path, the Symfony Demo data ×100 in PostgreSQL 17 or MySQL 8.4. Every implementation must return equivalent JSON content, checked by hashing canonicalized responses (keys sorted, escaping normalized) before measuring.
-- **The stacks:** PHP-FPM with nginx, FrankenPHP, RoadRunner and Swoole; Go `net/http`; Node `node:http` and Fastify; Rust hyper; Java Jetty 12 on virtual threads; .NET 10 Kestrel; Python uvicorn; Ruby Puma. PHP has four because they are four execution models (a process per request, a thread per request, a pool of exec'd workers, coroutines); other languages and runtimes are welcome as contributions. Each stack uses a widely used low-level driver of its ecosystem with its plain documented call — the choice of driver is part of the result. Minimal applications without full application frameworks or ORMs (Fastify, a Node HTTP framework, is the one exception); frameworks are the next stage.
-- **The rules** ([docs/rules.md](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/docs/rules.md)): runtimes and servers with the production setup their own documentation gives (php.ini-production and OPcache, `uvicorn[standard]`, the `dotnet new web` host, …), database drivers on their defaults, and the same sizing for everyone: process counts per CPU, 24 database connections per stack (PHP workers hold one each: FPM 32, FrankenPHP and RoadRunner 16), one connection per request. The few departures from a default are listed there with the reason for each.
-- **The machine:** stack on 4 cores / 8 threads of an AMD Ryzen 9 5950X, databases, load generator and an upstream stub on other cores of the same host, over loopback.
-- **The metric:** cgroup CPU time of the stack's containers per request served, and separately the CPU time of the database server per request. At least three passes of every series; the checks in the .NET section below are one pass each.
-- **When and what:** measured on 16–17 October 2026 with PHP 8.5.11, Go 1.27.2, Node 24.22, Rust 1.99, Java 25, .NET 10.0.13, Python 3.14.8, Ruby 4.0.7, PostgreSQL 17.11 and MySQL 8.4.11. The load generator for the fixed rates is wrk2, which corrects for coordinated omission.
+- **The stacks:** PHP-FPM with nginx, FrankenPHP, RoadRunner and Swoole; Go `net/http`; Node `node:http` and Fastify; Rust hyper; Java Jetty 12 on virtual threads; .NET 10 Kestrel; Python uvicorn; Ruby Puma. PHP has four because they are four execution models: FPM runs a process per request, FrankenPHP a thread per request, RoadRunner a pool of PHP worker processes started by a Go server, Swoole coroutines. Other languages and runtimes are welcome as contributions. Each stack uses a widely used low-level driver of its ecosystem with its plain documented call, and the choice of driver is part of the result. PostgreSQL: pgx (Go), node-postgres, tokio-postgres (Rust), PgJDBC, Npgsql, asyncpg, `pg` (Ruby), pdo_pgsql. MySQL: go-sql-driver, mysql2 (Node), mysql_async (Rust), Connector/J, MySqlConnector, asyncmy, trilogy (Ruby), pdo_mysql. Minimal applications without full application frameworks or ORMs (Fastify, a Node HTTP framework, is the one exception); frameworks are the next stage.
+- **The rules** ([docs/rules.md](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/docs/rules.md)): runtimes and servers with the production setup their own documentation gives (php.ini-production and OPcache, `uvicorn[standard]`, the `dotnet new web` host, …), database drivers on their defaults, and the same sizing for everyone. With the stack's 8 CPUs: FPM runs 32 children, FrankenPHP and RoadRunner 16 workers, Swoole, Node (in cluster mode) and Python 8 processes, Ruby Puma 8 workers with 3 threads each, and Go, Rust, Java and .NET one process. Stacks with a connection pool get 24 database connections. PHP workers keep one connection each instead, so FPM has 32 and FrankenPHP and RoadRunner 16. A request takes one connection for all its statements. The few departures from a default are listed there with the reason for each.
+- **The machine:** stack on 4 cores / 8 threads of an AMD Ryzen 9 5950X. The databases, the load generator and a stub of a slow external service (for the waiting series below) run on other cores of the same host, over loopback.
+- **The metric:** cgroup CPU time of the stack's containers per request served, and separately the CPU time of the database server per request. At least three passes of every series, and the tables show the median. The min–max of the passes is in [the tables](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md). The checks in the .NET section below are one pass each.
+- **When and what:** measured on 16–17 October 2026 with PHP 8.5.11, Go 1.27.2, Node 24.22, Rust 1.99, Java 25, .NET 10.0.13, Python 3.14.8, Ruby 4.0.7, PostgreSQL 17.11 and MySQL 8.4.11. The load generator for the fixed rates is wrk2.
 
 ## CPU per request at the same load
 
-CPU per request is CPU time summed across all cores of the stack's containers (or of the database server), divided by the requests served — a cost, not a latency. Both tables are at a fixed 2000 req/s over 48 connections, without waiting ([section 1a](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md)), each sorted by stack + database. Every stack runs the same code against both databases; only the driver changes.
+CPU per request is CPU time summed across all cores of the stack's containers (or of the database server), divided by the requests served — a cost, not a latency. Both tables are at a fixed 2000 req/s over 48 connections, and the requests don't call any slow service ([section 1a](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md)), each sorted by stack + database. Every stack runs the same code against both databases; only the driver changes.
 
 ### PostgreSQL
 
@@ -62,7 +68,7 @@ CPU per request is CPU time summed across all cores of the stack's containers (o
 | Go net/http                    |   0.56 ms |      1.35 ms |          1.91 ms |
 | .NET 10 Kestrel                |   0.88 ms |      1.22 ms |          2.10 ms |
 
-Three things stand out. The stacks themselves are close: 0.27–0.51 ms of CPU per request on PostgreSQL and 0.19–0.56 ms on MySQL, with .NET as the exception on both (more on that below). On PostgreSQL the database column splits the table in two: three stacks cost the database about half a millisecond per request, all the others 1.2–1.5 ms. On MySQL there is no such split: the database spends 1.12–1.35 ms for every stack. Latency is unremarkable: at 4000 req/s, p99 is 3.6–10.4 ms for every stack on PostgreSQL except Swoole (78 ms; [below](#swoole-on-postgresql-at-4000-reqs)), and 6.5–8.2 ms for every stack on MySQL.
+Three things stand out. The stacks themselves are close: 0.27–0.51 ms of CPU per request on PostgreSQL and 0.19–0.56 ms on MySQL, with .NET as the exception on both: its thread pool spins while idle, and with one runtime setting it is at the level of Java and Go ([below](#net-the-cpu-of-waiting-for-work)). On PostgreSQL the database column splits the table in two: three stacks cost the database about half a millisecond per request, all the others 1.2–1.5 ms. On MySQL there is no such split: the database spends 1.12–1.35 ms for every stack. Latency is unremarkable. The tables record it only at the highest rate, 4000 req/s, and there p99 is 3.6–10.4 ms for every stack on PostgreSQL except Swoole (78 ms; [below](#swoole-on-postgresql-at-4000-reqs)), and 6.5–8.2 ms for every stack on MySQL.
 
 ## PostgreSQL: the driver's default decides
 
@@ -70,22 +76,35 @@ The three cheap rows are exactly the three whose drivers keep prepared statement
 
 So with every stack on its defaults, the database work per request differs by a factor of two to three, and that difference — 0.65–0.99 ms — is larger than the whole CPU cost of most runtimes. Rust has the cheapest stack and a total in the expensive half of the table, because of the call it uses ([below](#tokio-postgres-query-prepares-every-statement)). That is why this compares drivers and the calls chosen more than languages.
 
-For PHP-FPM on PostgreSQL I measured four statement configurations — three PDO modes and PgBouncer in front of native prepares ([section 6](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md), at C = 50, that is 48 connections, with the database saturated, so the absolute numbers are higher than at 2000 req/s):
+### Within one stack
 
-| PDO mode                                                      | stack + database per request |
+To check that the driver and not the runtime moves the database cost, I changed one connection-string option at a time and kept everything else ([follow-up series](https://github.com/ArtUkrainskiy/web-request-cost/tree/main/results/2026-10-drivers), 2000 req/s, 3 passes each on 22 October 2026, defaults and options alternating):
+
+| stack and driver setting                                  | database CPU | stack + database |
+| --------------------------------------------------------- | -----------: | ---------------: |
+| Go, pgx default (statement cache)                         |      0.53 ms |          0.93 ms |
+| Go, pgx without the cache (`default_query_exec_mode=exec`) |      1.21 ms |          1.59 ms |
+| .NET, Npgsql default                                      |      1.29 ms |          2.11 ms |
+| .NET, Npgsql with `Max Auto Prepare=20`                   |      0.59 ms |          1.36 ms |
+
+Without its cache, Go lands among the stacks whose drivers parse every statement. With auto-prepare, .NET's database cost drops close to Go's and Java's 0.52 ms. The stack's own CPU moves little: Go 0.40 → 0.40 ms, .NET 0.83 → 0.77 ms. The defaults repeat the main table within 2%.
+
+For PHP-FPM on PostgreSQL I measured four statement configurations: three PDO modes and PgBouncer in front of native prepares ([section 6](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md)). This is a different load from the tables above: 50 clients sending requests back to back over 48 connections, with the database saturated. So every number here is higher than at 2000 req/s, including Go's and Java's.
+
+| PDO mode, 50 clients, database saturated                      | stack + database per request |
 | ------------------------------------------------------------- | ---------------------------: |
 | native prepares, direct (pdo_pgsql's default)                 |                      2.60 ms |
 | `PDO::ATTR_EMULATE_PREPARES`                                  |                      2.13 ms |
 | `Pdo\Pgsql::ATTR_DISABLE_PREPARES`                            |                      2.21 ms |
 | native prepares through PgBouncer (`max_prepared_statements`) |                      1.91 ms |
 
-At this workload the default is the most expensive of the four; what each mode does is in [the finding below](#pdo_pgsql-prepares-and-closes-every-statement). Even the cheapest leaves FPM above Go (1.09 ms) and Java (1.11 ms) at the same load: of FPM's gap to Go, PgBouncer closes 46% and emulated prepares 32%.
+At this load the default is the most expensive of the four. It is also what Laravel uses: its connector sets [`PDO::ATTR_EMULATE_PREPARES => false`](https://github.com/laravel/framework/blob/12.x/src/Illuminate/Database/Connectors/Connector.php). What each mode does is in [the finding below](#pdo_pgsql-prepares-and-closes-every-statement). Even the cheapest leaves FPM above Go (1.09 ms) and Java (1.11 ms) at the same load: PgBouncer takes FPM from 2.60 to 1.91 ms, about half of the way to Go.
 
 ## MySQL: the stack's own CPU matters more
 
 On MySQL, ten of the twelve stacks send each statement as one text query, with the parameters escaped on the client: PDO in the four PHP stacks (emulated prepares are pdo_mysql's default), mysql2 in both Node stacks, Connector/J, MySqlConnector, asyncmy and trilogy. There is nothing to cache, and the database spends 1.12–1.27 ms per request for all ten; why FPM is at the top of that range and Java at the bottom I have not checked. The two stacks whose drivers prepare on the server cost the database 0.05–0.23 ms more than that — Go 1.35 ms ([below](#go-databasesql-with-go-sql-driver-prepares-every-statement-on-mysql)) and Rust 1.32 ms ([below](#mysql_async-the-pools-session-reset-drops-prepared-statements)) — against differences of 0.65–0.99 ms on PostgreSQL.
 
-With the database cost this close, the stack's CPU explains more of the order than on PostgreSQL. Eight stacks are within 1.48–1.61 ms in total; Swoole is the lowest at 1.35 ms, with 0.19 ms in the stack, and Go and .NET are the highest. FrankenPHP's 0.33 ms includes a lock that every thread of a ZTS PHP build takes in mysqlnd, about 0.03 ms of it at this rate ([below](#mysqlnd-statistics-in-zts-builds)). .NET is the most expensive stack on MySQL as well (0.88 ms), with the same pattern as on PostgreSQL: 1.02 / 0.88 / 0.76 ms at 1000 / 2000 / 4000 req/s.
+With the database cost this close, the stack's CPU explains more of the order than on PostgreSQL. Eight stacks are within 1.48–1.61 ms in total; Swoole is the lowest at 1.35 ms, with 0.19 ms in the stack, and Go and .NET are the highest. Swoole's 0.19 ms is below Rust's 0.27 ms, so I checked how it is counted: Swoole runs as one container with all its processes, so the cgroup sees all of them, and its responses pass the same hash check before every run. On MySQL it sends one text query per statement, while on PostgreSQL pdo_pgsql makes three exchanges per statement, which may explain its 0.36 ms there. I haven't traced that. Go's place is its driver's default: go-sql-driver prepares and closes every statement. With `interpolateParams=true` it sends text queries like the others, and in the follow-up series Go's total drops from 1.89 to 1.54 ms ([below](#go-databasesql-with-go-sql-driver-prepares-every-statement-on-mysql)). FrankenPHP's 0.33 ms includes a lock that every thread of a ZTS PHP build takes in mysqlnd, about 0.03 ms of it at this rate ([below](#mysqlnd-statistics-in-zts-builds)). .NET is the most expensive stack on MySQL as well (0.88 ms), with the same pattern as on PostgreSQL: 1.02 / 0.88 / 0.76 ms at 1000 / 2000 / 4000 req/s.
 
 ## .NET: the CPU of waiting for work
 
@@ -93,16 +112,16 @@ With the database cost this close, the stack's CPU explains more of the order th
 
 ## Waiting requests and memory
 
-The third series makes every request wait on another service, 0.1 s or 1 s, as if it called a slow API. Here the execution model matters. For blocking models — PHP-FPM, FrankenPHP, RoadRunner, Puma's threads — the harness provisions a PHP worker per waiting request (RoadRunner accepts at most 500) and about two Puma threads per waiting request, so the series shows what each model needs to hold C requests that wait, not how a fixed production pool behaves. This series ran on PostgreSQL only.
+The third series makes every request wait on another service, 0.1 s or 1 s, as if it called a slow API. Here the execution model matters. Blocking models need a worker for every request that waits. So the harness starts one PHP worker per waiting request for FPM, FrankenPHP and RoadRunner (RoadRunner accepts at most 500), and about two Puma threads per waiting request. The series shows how much memory each model needs to hold that many waiting requests, not how a fixed production pool behaves. This series ran on PostgreSQL only.
 
-Memory growth per 1000 requests that each wait 1 s ([section 3](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md)):
+Memory here is anonymous memory, shared memory and kernel memory of all the stack's containers at the peak of the cgroup's `memory.current`. Memory growth per 1000 requests that each wait 1 s ([section 3](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md)):
 
 | model                                   | memory per 1000 waiting requests |
 | --------------------------------------- | -------------------------------: |
 | RoadRunner (a PHP worker per request)   |                         11.5 GiB |
 | PHP-FPM (a child process per request)   |                          1.1 GiB |
 | FrankenPHP (a PHP thread per request)   |                         0.96 GiB |
-| Node (`node:http`, up to 1000 requests) |                         0.90 GiB |
+| Node (`node:http`, see below)           |                         0.90 GiB |
 | Java, virtual threads                   |                         0.44 GiB |
 | Ruby Puma (threads)                     |                         0.41 GiB |
 | .NET                                    |                         0.23 GiB |
@@ -111,7 +130,7 @@ Memory growth per 1000 requests that each wait 1 s ([section 3](https://github.c
 | Rust                                    |                         0.08 GiB |
 | Python (asyncio)                        |                         0.02 GiB |
 
-These are slopes of one series, not the size of one request, and they do not carry over to other loads: Node's 0.90 GiB is its heap growing up to 1000 concurrent requests, after which it adds only 0.14 GiB per 1000; Node at about 1000 req/s with a 0.1 s wait uses twice what the slope predicts; and Java's slope varies between passes from 0.39 to 0.76 GiB. What is stable is the order at the ends: RoadRunner far above everything else in every pass ([below](#roadrunner-memory-per-worker)), the coroutine, goroutine, async and Rust stacks at about a tenth of a GiB or less.
+These numbers are how fast memory grows with the number of waiting requests in this one series, not the size of one request, and they don't carry over to other loads. Node's 0.90 GiB is its heap growing up to 1000 concurrent requests, after which it adds only 0.14 GiB per 1000; Node at about 1000 req/s with a 0.1 s wait uses twice what the slope predicts; and Java's slope varies between passes from 0.39 to 0.76 GiB. What is stable is the order at the ends: RoadRunner far above everything else in every pass ([below](#roadrunner-memory-per-worker)), the coroutine, goroutine, async and Rust stacks at about a tenth of a GiB or less.
 
 ## What it costs in money
 
@@ -121,15 +140,15 @@ The repository turns these numbers into dollars with an explicit model ([section
 
 Each finding has its own heading so that it can be linked from issues and discussions, and each says what it was measured on. Unless a finding says otherwise, the setup is the one above: this API (four SQL statements per request), the stack on 4 cores / 8 threads of a Ryzen 9 5950X, the database on the same host over loopback, numbers from the series in the repository at `afd7ea6`. "Not measured" means the cause is shown but the fix was not run; that is the next stage.
 
-| finding                                                                                                              | observed                                                  | fix                          | effect of the fix                          |
-| -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- | ---------------------------- | ------------------------------------------ |
-| [mysqlnd statistics in ZTS builds](#mysqlnd-statistics-in-zts-builds)                                                | +9.4% stack CPU for FrankenPHP on MySQL at 2000 req/s, +32% at saturation | php.ini today; patch for php-src | +0.8% and +2.8%                          |
-| [pdo_pgsql prepares and closes every statement](#pdo_pgsql-prepares-and-closes-every-statement)                      | three exchanges per statement                             | PDO attribute or PgBouncer   | −15% to −27% stack + database              |
-| [.NET thread pool spinning](#net-thread-pool-spinning)                                                               | 0.82 ms stack CPU at 2000 req/s (one-pass check)          | runtime knob                 | 0.32 ms                                    |
-| [Puma threads above the pool size](#puma-threads-above-the-pool-size)                                                | p99 1424 ms at 200 clients                                | thread count                 | p99 44 ms                                  |
-| [tokio-postgres query prepares every statement](#tokio-postgres-query-prepares-every-statement)                      | 1.44 ms database CPU against 0.52 ms for Go and Java      | another call or the pool's cache | not measured                           |
-| [Go database/sql with go-sql-driver prepares every statement on MySQL](#go-databasesql-with-go-sql-driver-prepares-every-statement-on-mysql) | 1.35 ms database CPU, the highest on MySQL | DSN option                   | not measured                               |
-| [mysql_async: the pool's session reset drops prepared statements](#mysql_async-the-pools-session-reset-drops-prepared-statements) | every statement prepared again               | pool option                  | not measured                               |
+| finding | observed | fix | after the fix |
+| --- | --- | --- | --- |
+| [mysqlnd lock in ZTS](#mysqlnd-statistics-in-zts-builds) | statistics cost FrankenPHP +9.4% stack CPU on MySQL at 2000 req/s, +32% at saturation | php.ini today; patch for php-src | with a prototype of the patch, statistics cost +0.8% and +2.8% |
+| [pdo_pgsql](#pdo_pgsql-prepares-and-closes-every-statement) | three exchanges per statement | PDO attribute or PgBouncer | −15% to −27% stack + database |
+| [.NET thread pool](#net-thread-pool-spinning) | 0.82 ms stack CPU at 2000 req/s (one pass) | runtime knob | 0.32 ms |
+| [Puma threads](#puma-threads-above-the-pool-size) | p99 1424 ms at 200 clients | thread count | p99 44 ms |
+| [tokio-postgres](#tokio-postgres-query-prepares-every-statement) | 1.44 ms database CPU against 0.52 ms for Go and Java | another call or the pool's cache | not measured |
+| [go-sql-driver](#go-databasesql-with-go-sql-driver-prepares-every-statement-on-mysql) | 1.35 ms database CPU, the highest on MySQL | DSN option | −18% stack + database |
+| [mysql_async](#mysql_async-the-pools-session-reset-drops-prepared-statements) | every statement prepared again | pool option | not measured |
 
 Two more observations have no confirmed cause yet: [Swoole on PostgreSQL at 4000 req/s](#swoole-on-postgresql-at-4000-reqs) and [RoadRunner memory per worker](#roadrunner-memory-per-worker), in [open questions](#open-questions).
 
@@ -171,7 +190,8 @@ Two more observations have no confirmed cause yet: [Swoole on PostgreSQL at 4000
 
 - **Setup:** Go `net/http` with `database/sql` and go-sql-driver, MySQL 8.4.11, 2000 req/s.
 - **What:** go-sql-driver does not interpolate parameters by default, so `database/sql` prepares, executes and closes every parameterized statement: 40 of each for 10 requests in the wire check. Go costs MySQL 1.35 ms per request, the most of the twelve, and its stack CPU is 0.56 ms against 0.40 ms with pgx on PostgreSQL.
-- **Fix, not measured:** [`interpolateParams=true`](https://github.com/go-sql-driver/mysql#interpolateparams) in the DSN, which sends one text query per statement like most MySQL drivers here.
+- **Fix:** [`interpolateParams=true`](https://github.com/go-sql-driver/mysql#interpolateparams) in the DSN, which sends one text query per statement like most MySQL drivers here.
+- **Measured** in the [follow-up series](https://github.com/ArtUkrainskiy/web-request-cost/tree/main/results/2026-10-drivers): stack + database 1.89 → 1.54 ms per request, the stack 0.58 → 0.42 ms and the database 1.32 → 1.12 ms; p99 5.8 → 5.5 ms.
 
 ### mysql_async: the pool's session reset drops prepared statements
 
@@ -196,7 +216,7 @@ Two more observations have no confirmed cause yet: [Swoole on PostgreSQL at 4000
 ## What this means for PHP
 
 - On PostgreSQL the four PHP stacks are in the expensive half of the table. A quarter to a half of FPM's gap to Go at saturation comes from pdo_pgsql's default: another PDO mode or PgBouncer takes FPM from 2.60 to 1.91–2.21 ms, against 1.09 ms for Go.
-- On MySQL, Swoole and FrankenPHP have the lowest totals of all twelve stacks, and FrankenPHP pays for a lock in mysqlnd that can be switched off today; a patch to remove it is proposed for php-src ([#24448](https://github.com/php/php-src/pull/24448)).
+- On MySQL, Swoole has the lowest total of all twelve stacks and FrankenPHP the second lowest, and FrankenPHP pays for a lock in mysqlnd that can be switched off today; a patch to remove it is proposed for php-src ([#24448](https://github.com/php/php-src/pull/24448)).
 - FPM needs 1.1 GiB per 1000 waiting requests; RoadRunner, also a process per request, about ten times that, for a reason not yet confirmed.
 - Swoole and FrankenPHP worker mode are the cheapest PHP stacks on both databases; RoadRunner, which also keeps the application in memory, spends more in the stack than either.
 
@@ -208,13 +228,13 @@ The measurement is about defaults, but the lesson is practical: find out what yo
 - **MySQL:** the server counts prepares and closes. If `Com_stmt_prepare` in `SHOW GLOBAL STATUS` grows as fast as `Com_stmt_execute`, every statement is prepared again; if `Com_stmt_close` grows with them, the driver prepares and closes each one.
 - **PHP with MySQL on a threaded server** (FrankenPHP, Apache with a threaded MPM, ext/parallel): if `php -i` shows `Thread Safety => enabled`, set `mysqlnd.collect_statistics=0` unless something reads the statistics.
 
-The drivers here offer two different remedies. Some keep statements prepared on the server: Npgsql's `Max Auto Prepare`, deadpool-postgres' `prepare_cached`, named statements in node-postgres, PgBouncer with `max_prepared_statements` in front of PDO. Others cut the exchanges per statement instead, with the database still parsing each one: PDO's emulated prepares or `ATTR_DISABLE_PREPARES`, tokio-postgres' `query_typed`, and go-sql-driver's `interpolateParams` on MySQL. What each does to this API is what the next stage measures, on every stack together.
+The drivers here offer two different remedies. Some keep statements prepared on the server: Npgsql's `Max Auto Prepare`, deadpool-postgres' `prepare_cached`, named statements in node-postgres, PgBouncer with `max_prepared_statements` in front of PDO. Others cut the exchanges per statement instead, with the database still parsing each one: PDO's emulated prepares or `ATTR_DISABLE_PREPARES`, tokio-postgres' `query_typed`, and go-sql-driver's `interpolateParams` on MySQL. Three of them are measured in [the series above](#within-one-stack) and in the go-sql-driver finding. The rest is what the next stage measures, on every stack together.
 
 ## What this does not show
 
 - **Languages in general.** One read-only API, no frameworks, no writes, caches, logging or business logic. The "stack" CPU includes the HTTP server, the driver and the JSON encoder, not only the VM.
 - **The cloud.** One desktop machine with boost on, everything over loopback. In a deployment of several VMs, network interrupts and wake-ups across vCPUs add CPU per request, more for some models than for others; a cloud run is planned as a separate publication.
-- **Tuned stacks.** Every driver is on its default on purpose. Turning on statement caching everywhere would likely close most of the database gap on PostgreSQL; that is the next stage, measured for all stacks at once.
+- **Tuned stacks.** Every driver is on its default on purpose. Turning on statement caching everywhere would likely close most of the database gap on PostgreSQL. The follow-up series shows it for .NET; for every stack at once it is the next stage.
 - **Independent review.** I wrote the implementations with an AI assistant and checked them for equivalent responses; as of this run they have not been reviewed by each language's community. I contribute to PHP, which is why the rules are written down before the numbers.
 
 ## Next
@@ -230,3 +250,7 @@ Some questions I would like people who run these stacks to answer, in [the repos
 - Swoole: is a pool of 3 connections per worker under pdo_pgsql a fair default, or do services use `Swoole\Coroutine\PostgreSQL` or larger pools?
 
 If the implementation or configuration of a stack looks wrong to you, please open an issue too: the results are re-published whenever a mistake is found.
+
+## Data
+
+Everything in this post comes from the repository [web-request-cost](https://github.com/ArtUkrainskiy/web-request-cost/tree/afd7ea6ee4f2f10069bd029e0c29a705c034861c) at commit `afd7ea6`: the code, the rules, 700 raw records and the script that turns them into [the tables](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md). The [mysqlnd finding](#mysqlnd-statistics-in-zts-builds) adds a follow-up series in the same repository; the [Swoole question](#swoole-on-postgresql-at-4000-reqs) cites one run that is not in it.
