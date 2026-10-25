@@ -189,6 +189,10 @@ fired off a pile of PRs in one go.
 **24 authors** (11%) opened a new PR after at least one of their PRs had been
 accepted.
 
+At the author level: 82 of the 219 authors (37%) have had at least one PR
+accepted. The other 137 (63%) have none yet — but 100 of them still have an open
+PR pending, so only 37 authors (17%) are left with no acceptance and nothing open.
+
 How easily a PR goes through depends a lot on which one it is in the author's
 history. Let's split all 831 PRs by the place each one takes in its author's
 history (every PR in exactly one group; in parentheses — how many accepted):
