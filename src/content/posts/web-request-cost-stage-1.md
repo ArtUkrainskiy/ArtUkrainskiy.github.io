@@ -98,7 +98,7 @@ For PHP-FPM on PostgreSQL I measured four statement configurations: three PDO mo
 | `Pdo\Pgsql::ATTR_DISABLE_PREPARES`                            |                      2.21 ms |
 | native prepares through PgBouncer (`max_prepared_statements`) |                      1.91 ms |
 
-At this load the default is the most expensive of the four. It is also what Laravel uses: its connector sets [`PDO::ATTR_EMULATE_PREPARES => false`](https://github.com/laravel/framework/blob/12.x/src/Illuminate/Database/Connectors/Connector.php). What each mode does is in [the finding below](#pdo_pgsql-prepares-and-closes-every-statement). Even the cheapest leaves FPM above Go (1.09 ms) and Java (1.11 ms) at the same load: PgBouncer takes FPM from 2.60 to 1.91 ms, about half of the way to Go.
+At this load the default is the most expensive of the four. It is also what Laravel gets on PostgreSQL: its [PostgreSQL connector](https://github.com/laravel/framework/blob/12.x/src/Illuminate/Database/Connectors/PostgresConnector.php) doesn't change PDO's prepare mode, so pdo_pgsql's native prepares stay on. What each mode does is in [the finding below](#pdo_pgsql-prepares-and-closes-every-statement). Even the cheapest leaves FPM above Go (1.09 ms) and Java (1.11 ms) at the same load: PgBouncer takes FPM from 2.60 to 1.91 ms, about half of the way to Go.
 
 ## MySQL: the stack's own CPU matters more
 
@@ -150,14 +150,14 @@ Each finding has its own heading so that it can be linked from issues and discus
 | [go-sql-driver](#go-databasesql-with-go-sql-driver-prepares-every-statement-on-mysql) | 1.35 ms database CPU, the highest on MySQL | DSN option | −18% stack + database |
 | [mysql_async](#mysql_async-the-pools-session-reset-drops-prepared-statements) | every statement prepared again | pool option | not measured |
 
-Two more observations have no confirmed cause yet: [Swoole on PostgreSQL at 4000 req/s](#swoole-on-postgresql-at-4000-reqs) and [RoadRunner memory per worker](#roadrunner-memory-per-worker), in [open questions](#open-questions).
+One more observation has no confirmed cause yet: [Swoole on PostgreSQL at 4000 req/s](#swoole-on-postgresql-at-4000-reqs), in [open questions](#open-questions). [RoadRunner's memory per worker](#roadrunner-memory-per-worker) is broken down there too.
 
 ### mysqlnd statistics in ZTS builds
 
 - **Setup:** a follow-up series on the same harness, builds, machine and CPUs ([results/2026-10-mysqlnd](https://github.com/ArtUkrainskiy/web-request-cost/blob/ba122ac9e4feae2d883d4a815720cd4d264b32cd/results/2026-10-mysqlnd/README.md)): FrankenPHP 1.13.1 worker mode with 16 workers, PHP 8.5.11 ZTS, this API on MySQL 8.4.11, fixed 1000 / 2000 / 4000 req/s over 48 connections and 50 clients with the database saturated, 3 passes with the variants alternating.
 - **What:** in thread-safe (ZTS) PHP builds, every update of mysqlnd's client statistics locks a mutex. One set of statistics is global to the process, so all PHP threads take the same mutex on every counted packet and row (each connection's own statistics take a second, per-connection mutex) ([`mysqlnd_statistics.h`](https://github.com/php/php-src/blob/1c9242e7fecbaff646b677b46cf9962831fc2fa2/ext/mysqlnd/mysqlnd_statistics.h#L19-L32)). Statistics are on by default (`mysqlnd.collect_statistics=1`, [`php_mysqlnd.c`](https://github.com/php/php-src/blob/1c9242e7fecbaff646b677b46cf9962831fc2fa2/ext/mysqlnd/php_mysqlnd.c#L151)). It affects FrankenPHP and other threaded SAPIs with MySQL, through PDO and mysqli; NTS builds — FPM, RoadRunner and Swoole here — compile the lock away. The FrankenPHP row of the MySQL table above runs with statistics on, the default.
 - **Measured:** stack CPU per request with statistics on against `mysqlnd.collect_statistics=0`: 0.327 against 0.298 ms at 2000 req/s (+9.4%), +7.2% at 1000 req/s, +17.7% at 4000 req/s and +32% at saturation (0.411 against 0.312 ms); the cost grows with the rate. With the counters made atomic ([prototype patch](https://github.com/ArtUkrainskiy/web-request-cost/blob/ba122ac9e4feae2d883d4a815720cd4d264b32cd/results/2026-10-mysqlnd/mysqlnd-atomic-php-8.5.11.patch)), statistics on cost 0.8–2.8% more than off at every load. The database's CPU is the same for all three.
-- **Fix:** today, `mysqlnd.collect_statistics=0` on threaded deployments that do not read `mysqli_get_client_stats()` or the mysqlnd section of `phpinfo()`. For php-src, a patch for master that replaces the mutex with relaxed C11 atomic counters is proposed in [php/php-src#24448](https://github.com/php/php-src/pull/24448) (issue [#24447](https://github.com/php/php-src/issues/24447)); [a separate post](/posts/mysqlnd-zts-statistics/) has the patch, its measurements on php-src master and the correctness checks.
+- **Fix:** today, `mysqlnd.collect_statistics=0` on threaded deployments that do not read `mysqli_get_client_stats()` or the mysqlnd section of `phpinfo()`. In php-src, a patch that replaces the mutex with relaxed C11 atomic counters is merged into master for PHP 8.7: [php/php-src#24448](https://github.com/php/php-src/pull/24448) (issue [#24447](https://github.com/php/php-src/issues/24447)); [a separate post](/posts/mysqlnd-zts-statistics/) has the patch, its measurements on php-src master and the correctness checks.
 
 ### pdo_pgsql prepares and closes every statement
 
@@ -211,20 +211,20 @@ Two more observations have no confirmed cause yet: [Swoole on PostgreSQL at 4000
 
 - **Setup:** the waiting series, PostgreSQL, a PHP worker per waiting request, RoadRunner up to its limit of 500 workers ([section 3](https://github.com/ArtUkrainskiy/web-request-cost/blob/afd7ea6ee4f2f10069bd029e0c29a705c034861c/results/2026-10/tables.md)).
 - **What:** 11.5 GiB per 1000 waiting requests, about 11.8 MiB per worker, against 1.2 MiB per FPM child; both are a PHP process per request.
-- **Not explained yet:** FPM forks its children from one master, and they can share the master's memory — OPcache included — copy-on-write, while RoadRunner starts every worker as a separate PHP process with its own OPcache memory and heap. A breakdown of one worker's memory (`/proc/<pid>/smaps`) is the next check.
+- **Why:** RoadRunner starts every worker as a separate PHP process (exec), so each one has its own heap and, most likely, its own OPcache memory. FPM forks its children from one master, and they share the master's memory copy-on-write. In the stack's `memory.stat` a RoadRunner worker adds about 7.9 MiB of anonymous memory and 3.5 MiB of shared memory, an FPM child about 0.85 MiB of anonymous memory.
 
 ## What this means for PHP
 
 - On PostgreSQL the four PHP stacks are in the expensive half of the table. A quarter to a half of FPM's gap to Go at saturation comes from pdo_pgsql's default: another PDO mode or PgBouncer takes FPM from 2.60 to 1.91–2.21 ms, against 1.09 ms for Go.
-- On MySQL, Swoole has the lowest total of all twelve stacks and FrankenPHP the second lowest, and FrankenPHP pays for a lock in mysqlnd that can be switched off today; a patch to remove it is proposed for php-src ([#24448](https://github.com/php/php-src/pull/24448)).
-- FPM needs 1.1 GiB per 1000 waiting requests; RoadRunner, also a process per request, about ten times that, for a reason not yet confirmed.
+- On MySQL, Swoole has the lowest total of all twelve stacks and FrankenPHP the second lowest, and FrankenPHP pays for a lock in mysqlnd that can be switched off today; the fix is merged into php-src master and ships in PHP 8.7 ([#24448](https://github.com/php/php-src/pull/24448)).
+- FPM needs 1.1 GiB per 1000 waiting requests; RoadRunner, also a process per request, about ten times that, because each of its workers starts PHP from scratch instead of being forked from a master.
 - Swoole and FrankenPHP worker mode are the cheapest PHP stacks on both databases; RoadRunner, which also keeps the application in memory, spends more in the stack than either.
 
 ## What to check in your own service
 
 The measurement is about defaults, but the lesson is practical: find out what your driver does with each statement — from its documentation and code first.
 
-- **PostgreSQL:** a plain statement log does not show it, because with the extended protocol PostgreSQL logs a statement when it is executed, not when it is parsed. Logging the protocol stages (`log_parser_stats`, or `log_min_duration_statement = 0` with `log_duration`) or `pg_stat_statements` with planning statistics on (`pg_stat_statements.track_planning`, off by default) shows whether the same query is parsed and planned again on every request.
+- **PostgreSQL:** a plain statement log does not show it, because with the extended protocol PostgreSQL logs a statement when it is executed, not when it is parsed. Logging each protocol step (`log_min_duration_statement = 0` or `log_duration` logs Parse, Bind and Execute separately) or `pg_stat_statements` with planning statistics on (`pg_stat_statements.track_planning`, off by default) shows whether the same query is parsed and planned again on every request.
 - **MySQL:** the server counts prepares and closes. If `Com_stmt_prepare` in `SHOW GLOBAL STATUS` grows as fast as `Com_stmt_execute`, every statement is prepared again; if `Com_stmt_close` grows with them, the driver prepares and closes each one.
 - **PHP with MySQL on a threaded server** (FrankenPHP, Apache with a threaded MPM, ext/parallel): if `php -i` shows `Thread Safety => enabled`, set `mysqlnd.collect_statistics=0` unless something reads the statistics.
 
